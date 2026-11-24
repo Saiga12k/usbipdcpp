@@ -351,9 +351,44 @@ DeviceOperationResult LibusbServer::bind_host_device_with_wrapped_fd(intptr_t fd
     auto busid = get_device_busid(device_for_info);
     auto bus_num = libusb_get_bus_number(device_for_info);
     auto dev_addr = libusb_get_device_address(device_for_info);
-    // devnum 填端口号（同普通模式，见 bind_host_device 的注释）
-    auto dev_num = libusb_get_port_number(device_for_info);
+    // Wrapped descriptors may not expose the port topology. Use the USB device address.
+    auto dev_num = dev_addr;
     auto speed = (std::uint32_t) libusb_speed_to_usb_speed(libusb_get_device_speed(device_for_info));
+    // Some Android kernels cannot report speed for a wrapped USB file descriptor.
+    // USB 2 high-bandwidth ISO descriptors are valid only at high speed. Infer
+    // only this unambiguous case from the active configuration; never from a VID/PID.
+    constexpr auto high_bandwidth_usb2_iso = [](unsigned usb, unsigned attr, unsigned packet) {
+        const auto payload = packet & 0x7ffu;
+        const auto extra = (packet >> 11) & 3u;
+        return usb >= 0x0200 && usb < 0x0300 && (attr & 3u) == 1u &&
+               (packet & 0xe000u) == 0 && payload > 0 && payload <= 1024 &&
+               extra >= 1 && extra <= 2;
+    };
+    static_assert(high_bandwidth_usb2_iso(0x0200, 1, 0x1400));
+    static_assert(!high_bandwidth_usb2_iso(0x0200, 1, 1023));
+    static_assert(!high_bandwidth_usb2_iso(0x0300, 1, 0x1400));
+    static_assert(!high_bandwidth_usb2_iso(0x0200, 2, 0x1400));
+    static_assert(!high_bandwidth_usb2_iso(0x0200, 1, 0x1c00));
+    static_assert(!high_bandwidth_usb2_iso(0x0200, 1, 0x1401));
+    if (speed == static_cast<std::uint32_t>(UsbSpeed::Unknown)) {
+        for (int i = 0; i < active_config_desc->bNumInterfaces; ++i) {
+            const auto &interface = active_config_desc->interface[i];
+            for (int a = 0; a < interface.num_altsetting; ++a) {
+                const auto &alt = interface.altsetting[a];
+                for (int e = 0; e < alt.bNumEndpoints; ++e) {
+                    const auto &ep = alt.endpoint[e];
+                    if (high_bandwidth_usb2_iso(device_descriptor.bcdUSB, ep.bmAttributes, ep.wMaxPacketSize)) {
+                        speed = static_cast<std::uint32_t>(UsbSpeed::High);
+                        SPDLOG_WARN("Speed inferred from active USB2 high-bandwidth ISO descriptor: bcdUSB=0x{:04x} ep=0x{:02x} wMaxPacketSize=0x{:04x}",
+                                    device_descriptor.bcdUSB, ep.bEndpointAddress, ep.wMaxPacketSize);
+                        break;
+                    }
+                }
+                if (speed != static_cast<std::uint32_t>(UsbSpeed::Unknown)) break;
+            }
+            if (speed != static_cast<std::uint32_t>(UsbSpeed::Unknown)) break;
+        }
+    }
     auto configuration_value = active_config_desc->bConfigurationValue;
 
     // 信息已拷出，释放临时资源；之后创建 UsbDevice/handler 的分配异常

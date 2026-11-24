@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -182,6 +183,23 @@ public:
     std::shared_mutex transfers_mutex_;
     std::unordered_map<std::uint32_t, libusb_callback_args *> transfers_;
     std::atomic<std::size_t> pending_count_{0};
+
+    // Updated by the session receiver, except for the two callback counters.
+    struct IsoDiagnostics {
+        std::uint32_t session = 0;
+        std::uint64_t submitted = 0;
+        std::uint64_t failed = 0;
+        std::uint64_t cancel_requested = 0;
+        std::uint64_t cancel_accepted = 0;
+        std::atomic<std::uint64_t> callbacks{0};
+        std::atomic<std::uint64_t> cancelled{0};
+        bool seen_enomem = false;
+        std::chrono::steady_clock::time_point next_failure_log{};
+    } iso_diagnostics;
+
+    void log_iso_state(const char* event, const libusb_transfer* transfer = nullptr,
+                       std::uint32_t sequence = 0, int libusb_error = 0, int submit_errno = 0) noexcept;
+    int cancel_tracked_transfer(libusb_transfer* transfer);
 
     // 创建时拷贝的 handler 行为配置（运行期不变）
     LibusbDeviceHandlerConfig device_handler_config;

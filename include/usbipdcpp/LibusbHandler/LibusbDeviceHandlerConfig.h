@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 namespace usbipdcpp {
 
 /**
@@ -26,6 +28,12 @@ enum class LibusbSubmitErrorPolicy {
 struct LibusbDeviceHandlerConfig {
     /// libusb_submit_transfer 失败时的断连策略
     LibusbSubmitErrorPolicy submit_error_policy = LibusbSubmitErrorPolicy::DisconnectOnAnyError;
+
+    /** Optional per-session ISO telemetry. Called on the USB/IP receiver thread with a borrowed line. */
+    void (*report_iso_diagnostic)(std::string_view line) noexcept = nullptr;
+
+    /** Optional backend hook that returns and clears the current thread's last ISO submit errno, or zero. */
+    int (*take_iso_submit_errno)() noexcept = nullptr;
 };
 
 } // namespace usbipdcpp
