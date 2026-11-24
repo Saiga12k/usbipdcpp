@@ -6,6 +6,13 @@
 #include <iostream>
 #include <csignal>
 
+#if defined(__ANDROID__)
+#include <cerrno>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
+
 #include <asio/ip/tcp.hpp>
 #include <asio/detached.hpp>
 #include <asio/redirect_error.hpp>
@@ -17,6 +24,35 @@
 #include "usbipdcpp/type.h"
 #include "usbipdcpp/DeviceHandler/DeviceHandler.h"
 #include "usbipdcpp/Session.h"
+
+#if defined(__ANDROID__)
+namespace {
+void enable_android_tcp_keepalive(asio::ip::tcp::socket &socket) {
+    // KM6 can retain an established socket after Windows has discarded its end.
+    // Probe the TCP peer without imposing a USB traffic idle timeout.
+    constexpr int idle_seconds = 20;
+    constexpr int probe_interval_seconds = 5;
+    constexpr int probe_count = 3;
+    const auto fd = socket.native_handle();
+
+    // Set the short probe timings before enabling keepalive so a setup failure
+    // cannot silently enable the much longer system defaults.
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &probe_interval_seconds, sizeof(probe_interval_seconds)) != 0 ||
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0) {
+        const int error = errno;
+        SPDLOG_WARN("Failed to configure Android TCP keepalive: errno={}", error);
+        return;
+    }
+
+    asio::error_code ec;
+    socket.set_option(asio::socket_base::keep_alive(true), ec);
+    if (ec) {
+        SPDLOG_WARN("Failed to enable Android TCP keepalive: {}", ec.message());
+    }
+}
+}
+#endif
 
 usbipdcpp::Server::Server(const ServerNetworkConfig &network_config) :
     network_config(std::move(network_config)) {
@@ -547,6 +583,10 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
                     SPDLOG_WARN("Failed to set TCP no_delay: {}", socket_opt_ec.message());
                 }
             }
+
+#if defined(__ANDROID__)
+            enable_android_tcp_keepalive(session->socket);
+#endif
 
             // 用 ec 版获取对端地址：客户端可能在 accept 完成后、协程继续执行
             // 之前就已断开（尤其 RST），此时 remote_endpoint() 会抛异常。detached
