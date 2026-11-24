@@ -682,9 +682,8 @@ void usbipdcpp::Session::sender(usbipdcpp::error_code &ec) {
 
         if (sending_ec) {
             // TCP 写入失败，立即关闭 session 双向通信。
-            // 仅 break 退出 sender 不会让 receiver 退出：它挂在同步读上，而连接没有
-            // TCP keepalive，对端不主动断开时读不会自行返回（实测见 immediately_stop：
-            // Linux 一直挂着，Windows 要等约 240 秒的连接超时）。
+            // 仅 break 退出 sender 不会立即唤醒挂在同步读上的 receiver。
+            // 即使开启 TCP keepalive，只要对端仍响应探测，读也不会因此返回。
             // shutdown + cancel 跨平台打断 receiver 的挂起同步读（见
             // immediately_stop 注释）；与收尾的 close 互斥（socket_mutex）
             should_immediately_stop = true;
