@@ -1,6 +1,8 @@
 #include "usbipdcpp/LibusbHandler/LibusbDeviceHandler.h"
 
 #include <chrono>
+#include <cerrno>
+#include <format>
 #include <spdlog/spdlog.h>
 
 #include "usbipdcpp/Endpoint.h"
@@ -50,6 +52,46 @@ bool usbipdcpp::LibusbDeviceHandler::should_disconnect_on_submit_error(int err, 
     return policy == LibusbSubmitErrorPolicy::DisconnectOnAnyError;
 }
 
+void LibusbDeviceHandler::log_iso_state(const char* event, const libusb_transfer* transfer,
+                                        std::uint32_t sequence, int libusb_error, int submit_errno) noexcept {
+    const auto report = device_handler_config.report_iso_diagnostic;
+    if (!report) return;
+
+    try {
+        std::size_t tracked_iso = 0;
+        {
+            std::shared_lock lock(transfers_mutex_);
+            for (const auto& entry : transfers_) {
+                const auto* item = static_cast<libusb_transfer*>(entry.second->transfer.get());
+                if (item->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) ++tracked_iso;
+            }
+        }
+        // On failure the rejected request has already been removed from the tracker.
+        report(std::format(
+            "{} bus={} session={} endpoint=0x{:02x} seq={} libusb={} errno={} bytes={} packets={} "
+            "pending_all={} tracked_iso={} iso_submitted={} iso_failed={} iso_callbacks={} "
+            "iso_cancel_requested={} iso_cancel_accepted={} iso_cancelled={}",
+            event, handle_device.busid, iso_diagnostics.session,
+            transfer ? transfer->endpoint : 0, sequence, libusb_error, submit_errno,
+            transfer ? transfer->length : 0, transfer ? transfer->num_iso_packets : 0,
+            pending_count_.load(std::memory_order_relaxed), tracked_iso, iso_diagnostics.submitted,
+            iso_diagnostics.failed, iso_diagnostics.callbacks.load(std::memory_order_relaxed),
+            iso_diagnostics.cancel_requested, iso_diagnostics.cancel_accepted,
+            iso_diagnostics.cancelled.load(std::memory_order_relaxed)));
+    } catch (...) {
+        // Diagnostics are best effort: failures cannot interrupt transfer cleanup.
+    }
+}
+
+int LibusbDeviceHandler::cancel_tracked_transfer(libusb_transfer* transfer) {
+    const auto err = libusb_cancel_transfer(transfer);
+    if (device_handler_config.report_iso_diagnostic && transfer->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
+        ++iso_diagnostics.cancel_requested;
+        if (err == 0) ++iso_diagnostics.cancel_accepted;
+    }
+    return err;
+}
+
 usbipdcpp::LibusbDeviceHandler::~LibusbDeviceHandler() {
     if (native_device_) {
         libusb_unref_device(native_device_);
@@ -87,10 +129,21 @@ void usbipdcpp::LibusbDeviceHandler::on_new_connection(TransferResponder &curren
 
     // 标记客户端连接
     client_disconnection = false;
+    if (device_handler_config.report_iso_diagnostic) {
+        ++iso_diagnostics.session;
+        iso_diagnostics.submitted = iso_diagnostics.failed = 0;
+        iso_diagnostics.cancel_requested = iso_diagnostics.cancel_accepted = 0;
+        iso_diagnostics.callbacks.store(0, std::memory_order_relaxed);
+        iso_diagnostics.cancelled.store(0, std::memory_order_relaxed);
+        iso_diagnostics.seen_enomem = false;
+        iso_diagnostics.next_failure_log = {};
+        log_iso_state("session_open");
+    }
 }
 
 void usbipdcpp::LibusbDeviceHandler::on_disconnection(error_code &ec) {
     client_disconnection = true;
+    log_iso_state("session_draining");
     // 不检查 device_removed，因为 libusb 会在设备拔出时正确触发回调（LIBUSB_TRANSFER_NO_DEVICE）
 
     // 取消所有传输
@@ -101,7 +154,7 @@ void usbipdcpp::LibusbDeviceHandler::on_disconnection(error_code &ec) {
         // 等待 unique_lock，cancel 返回释放共享锁后即继续
         std::shared_lock lock(transfers_mutex_);
         for (auto &[seqnum, cb]: transfers_) {
-            auto err = libusb_cancel_transfer(static_cast<libusb_transfer *>(cb->transfer.get()));
+            auto err = cancel_tracked_transfer(static_cast<libusb_transfer *>(cb->transfer.get()));
             if (err) {
                 SPDLOG_ERROR("libusb_cancel_transfer failed on seqnum {}: {}", cb->seqnum, libusb_strerror(err));
             }
@@ -131,6 +184,7 @@ void usbipdcpp::LibusbDeviceHandler::on_disconnection(error_code &ec) {
         release_and_close_device();
     }
 
+    log_iso_state("session_closed");
     AbstDeviceHandler::on_disconnection(ec);
 }
 
@@ -372,7 +426,13 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
             return;
         }
 
+        const bool diagnose_iso = device_handler_config.report_iso_diagnostic &&
+                                  trx->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS;
+        const auto take_errno = diagnose_iso ? device_handler_config.take_iso_submit_errno : nullptr;
+        if (take_errno) take_errno();
         auto err = libusb_submit_transfer(trx);
+        const int submit_errno = take_errno ? take_errno() : 0;
+        if (diagnose_iso && err == 0) ++iso_diagnostics.submitted;
         if (err < 0) [[unlikely]] {
             SPDLOG_ERROR("传输失败，{}", libusb_strerror(err));
             {
@@ -384,6 +444,16 @@ void usbipdcpp::LibusbDeviceHandler::receive_urb(UsbIpCommand::UsbIpCmdSubmit cm
                 }
                 // 无需检查 unlinking：与 handle_unlink_seqnum 同线程串行，
                 // 理由见控制传输分支的注释，对齐内核 stub_recv_cmd_submit
+            }
+            if (diagnose_iso) {
+                ++iso_diagnostics.failed;
+                const auto now = std::chrono::steady_clock::now();
+                const bool first_enomem = submit_errno == ENOMEM && !iso_diagnostics.seen_enomem;
+                iso_diagnostics.seen_enomem |= first_enomem;
+                if (first_enomem || now >= iso_diagnostics.next_failure_log) {
+                    log_iso_state("iso_submit_failed", trx, seqnum, err, submit_errno);
+                    iso_diagnostics.next_failure_log = now + std::chrono::minutes(10);
+                }
             }
             callback_args->transfer.reset();
             if (!callback_args_pool_.free(callback_args)) {
@@ -437,7 +507,7 @@ void usbipdcpp::LibusbDeviceHandler::handle_unlink_seqnum(std::uint32_t unlink_s
 
             // 不在此处释放共享锁：libusb_cancel_transfer 仅设置标志位不调用回调，
             // 在锁内调用可防止 transfer_callback 拿到排他锁后释放 cb，导致下面 cb 悬空。
-            int err = libusb_cancel_transfer(static_cast<libusb_transfer *>(cb->transfer.get()));
+            int err = cancel_tracked_transfer(static_cast<libusb_transfer *>(cb->transfer.get()));
             if (err == LIBUSB_ERROR_NOT_FOUND) [[unlikely]] {
                 // transfer 在 libusb 层已完成但回调尚未执行。unlinking 已置位，
                 // 回调会走 unlink 分支入队 RET_UNLINK（带实际状态码）并唤醒 sender。
@@ -497,6 +567,14 @@ int usbipdcpp::LibusbDeviceHandler::tweak_set_interface_cmd(const SetupPacket &s
 
     SPDLOG_DEBUG("set_interface: inf {} alt {}", interface, alternate);
     int err = libusb_set_interface_alt_setting(native_handle, interface, alternate);
+    if (const auto report = device_handler_config.report_iso_diagnostic) {
+        try {
+            report(std::format("set_interface bus={} session={} interface={} alternate={} libusb={}",
+                               handle_device.busid, iso_diagnostics.session, interface, alternate, err));
+        } catch (...) {
+            // Log formatting is best effort.
+        }
+    }
     if (err) [[unlikely]] {
         SPDLOG_ERROR("{}: usb_set_interface error: inf {} alt {} err {}",
                      get_device_busid(libusb_get_device(native_handle)), interface, alternate, libusb_strerror(err));
@@ -694,6 +772,14 @@ enum libusb_transfer_status usbipdcpp::LibusbDeviceHandler::error2trxstat(int e)
 
 void LIBUSB_CALL usbipdcpp::LibusbDeviceHandler::transfer_callback(libusb_transfer *trx) {
     auto &callback_arg = *static_cast<libusb_callback_args *>(trx->user_data);
+    if (callback_arg.handler->device_handler_config.report_iso_diagnostic &&
+        trx->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
+        auto& diagnostics = callback_arg.handler->iso_diagnostics;
+        diagnostics.callbacks.fetch_add(1, std::memory_order_relaxed);
+        if (trx->status == LIBUSB_TRANSFER_CANCELLED) {
+            diagnostics.cancelled.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // SPDLOG_WARN("callback: seqnum={} type={} num_iso={} actual_length={} is_out={}", callback_arg.seqnum,
     //             static_cast<int>(trx->type), trx->num_iso_packets, trx->actual_length, callback_arg.is_out);
